@@ -1,12 +1,17 @@
 package service
 
 import (
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"strconv"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	log "github.com/sirupsen/logrus"
 
 	"golang.org/x/net/context"
 
@@ -27,6 +32,13 @@ func (s *service) NodeStageVolume(
 				codes.InvalidArgument,
 				"stage volume info 'device' key required")
 		}
+	}
+
+	if _, err := os.Stat("/tmp/stage-error"); err == nil {
+		return nil, status.Error(codes.InvalidArgument, "Mock error")
+	}
+	if _, err := os.Stat("/tmp/stage-timeout"); err == nil {
+		return nil, status.Error(codes.DeadlineExceeded, "Mock timeout")
 	}
 
 	if len(req.GetVolumeId()) == 0 {
@@ -69,6 +81,7 @@ func (s *service) NodeStageVolume(
 	}
 
 	// Stage the volume.
+	mount(req.GetStagingTargetPath())
 	v.VolumeContext[nodeStgPathKey] = device
 	s.vols[i] = v
 
@@ -86,6 +99,13 @@ func (s *service) NodeUnstageVolume(
 
 	if len(req.GetStagingTargetPath()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging Target Path cannot be empty")
+	}
+
+	if _, err := os.Stat("/tmp/unstage-error"); err == nil {
+		return nil, status.Error(codes.InvalidArgument, "Mock error")
+	}
+	if _, err := os.Stat("/tmp/unstage-timeout"); err == nil {
+		return nil, status.Error(codes.DeadlineExceeded, "Mock timeout")
 	}
 
 	s.volsRWL.Lock()
@@ -106,6 +126,7 @@ func (s *service) NodeUnstageVolume(
 	}
 
 	// Unpublish the volume.
+	unmount(req.GetStagingTargetPath())
 	delete(v.VolumeContext, nodeStgPathKey)
 	s.vols[i] = v
 
@@ -127,6 +148,13 @@ func (s *service) NodePublishVolume(
 				codes.InvalidArgument,
 				"stage volume info 'device' key required")
 		}
+	}
+
+	if _, err := os.Stat("/tmp/publish-error"); err == nil {
+		return nil, status.Error(codes.InvalidArgument, "Mock error")
+	}
+	if _, err := os.Stat("/tmp/publish-timeout"); err == nil {
+		return nil, status.Error(codes.DeadlineExceeded, "Mock timeout")
 	}
 
 	if len(req.GetVolumeId()) == 0 {
@@ -193,8 +221,10 @@ func (s *service) NodePublishVolume(
 				status.Errorf(codes.Internal, "staging target path %s does not exist", req.GetStagingTargetPath())
 			}
 			v.VolumeContext[nodeMntPathKey] = req.GetStagingTargetPath()
+			bindMount(req.GetStagingTargetPath(), req.GetTargetPath())
 		} else {
 			v.VolumeContext[nodeMntPathKey] = device
+			mount(req.GetTargetPath())
 		}
 		s.vols[i] = v
 	}
@@ -217,6 +247,13 @@ func (s *service) NodeUnpublishVolume(
 	s.volsRWL.Lock()
 	defer s.volsRWL.Unlock()
 
+	if _, err := os.Stat("/tmp/unpublish-error"); err == nil {
+		return nil, status.Error(codes.InvalidArgument, "Mock error")
+	}
+	if _, err := os.Stat("/tmp/unpublish-timeout"); err == nil {
+		return nil, status.Error(codes.DeadlineExceeded, "Mock timeout")
+	}
+
 	ephemeralVolume := MockVolumes[req.VolumeId].ISEphemeral
 	i, v := s.findVolNoLock("id", req.VolumeId)
 	if i < 0 && !ephemeralVolume {
@@ -236,6 +273,7 @@ func (s *service) NodeUnpublishVolume(
 		}
 
 		// Unpublish the volume.
+		unmount(req.GetTargetPath())
 		delete(v.VolumeContext, nodeMntPathKey)
 		s.vols[i] = v
 	}
@@ -389,4 +427,64 @@ func checkTargetExists(targetPath string) (bool, error) {
 	default:
 		return false, err
 	}
+}
+
+func mount(path string) {
+	if found, _ := isMountPoint(path); found {
+		return
+	}
+	cmdline := []string{"mount", "-t", "tmpfs", "xxx", path}
+	cmd := exec.Command(cmdline[0], cmdline[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Warnf("Executed: %v", cmdline)
+		log.Warnf("Output: %s", string(out))
+		log.Warnf("Err: %v", err)
+	}
+}
+
+func unmount(path string) {
+	if found, _ := isMountPoint(path); !found {
+		return
+	}
+	cmdline := []string{"umount", path}
+	cmd := exec.Command(cmdline[0], cmdline[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Warnf("Executed: %v", cmdline)
+		log.Warnf("Output: %s", string(out))
+		log.Warnf("Err: %v", err)
+	}
+}
+
+func bindMount(what, where string) {
+	if found, _ := isMountPoint(where); found {
+		return
+	}
+	cmdline := []string{"mount", "--bind", what, where}
+	cmd := exec.Command(cmdline[0], cmdline[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Warnf("Executed: %v", cmdline)
+		log.Warnf("Output: %s", string(out))
+		log.Warnf("Err: %v", err)
+	}
+}
+
+func isMountPoint(path string) (bool, error) {
+	mountInfo, err := ioutil.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	mountInfoLines := strings.Split(string(mountInfo), "\n")
+	for _, line := range mountInfoLines {
+		tokens := strings.Split(line, " ")
+		if len(tokens) < 4 {
+			continue
+		}
+		if tokens[4] == path {
+			return true, nil
+		}
+	}
+	return false, nil
 }
